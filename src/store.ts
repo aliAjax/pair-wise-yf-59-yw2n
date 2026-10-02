@@ -1,87 +1,141 @@
 import { configureStore, createSlice, type PayloadAction } from '@reduxjs/toolkit';
-import type { Protest, ProtestStatus, Race, RaceEntry, TimelineEvent } from './types';
 import { raceApi } from './api';
+import { applyAddProtest, applyMarkReviewed, applyPublish, applySaveResult, applySetRaceStatus, applyTransitionProtest, currentPublication, primaryRaceId } from './domain';
+import { commitLedger, loadLedger, subscribeLedger, type CommitResult } from './ledger';
+import type { LedgerDoc, ProtestStatus, RaceStatus } from './types';
 
-export interface AppState {
-  races: Race[];
-  entries: RaceEntry[];
-  protests: Protest[];
-  timeline: TimelineEvent[];
+export interface Notice {
+  id: string;
+  kind: 'success' | 'warning' | 'error' | 'info';
+  text: string;
 }
 
-const initialEntries: RaceEntry[] = [
-  { id: 'entry-1', boat: '海风号', sailNo: 'CHN 218', skipper: '林舟', elapsedSeconds: 3168, penaltySeconds: 0, resultStatus: 'provisional', note: '' },
-  { id: 'entry-2', boat: '远岚号', sailNo: 'CHN 106', skipper: '周屿', elapsedSeconds: 3194, penaltySeconds: 30, resultStatus: 'provisional', note: '标记争议' },
-  { id: 'entry-3', boat: '北辰号', sailNo: 'CHN 077', skipper: '许澄', elapsedSeconds: 3210, penaltySeconds: 0, resultStatus: 'official', note: '' }
-];
+interface LedgerState {
+  doc: LedgerDoc;
+  notices: Notice[];
+}
 
-const now = new Date();
-const initialStart = new Date(now.getTime() + 15 * 60 * 1000).toISOString();
-
-const initialState: AppState = {
-  races: [{ id: 'race-1', name: '海湾长距离赛 第1轮', fleet: '统一级', course: 'W2 / 东北风 12节', startsAt: initialStart, status: 'scheduled' }],
-  entries: initialEntries,
-  protests: [{ id: 'protest-1', raceId: 'race-1', entryId: 'entry-2', reason: '起航后发生舷侧接触', rule: 'RRS 14', status: 'reviewing', decision: '', createdAt: now.toISOString() }],
-  timeline: [
-    { id: 'event-1', time: now.toISOString(), type: 'race', message: '航线 W2 已发布' },
-    { id: 'event-2', time: new Date(now.getTime() + 2000).toISOString(), type: 'protest', message: '远岚号抗议进入复核' }
-  ]
+const boot = loadLedger();
+const initialState: LedgerState = {
+  doc: boot.doc,
+  notices: boot.notice ? [{ id: crypto.randomUUID(), kind: 'info', text: boot.notice }] : []
 };
 
 const slice = createSlice({
-  name: 'regatta',
+  name: 'ledger',
   initialState,
   reducers: {
-    setRaceStatus(state, action: PayloadAction<{ id: string; status: Race['status'] }>) {
-      const race = state.races.find((item) => item.id === action.payload.id);
-      if (race) {
-        race.status = action.payload.status;
-        state.timeline.unshift({ id: crypto.randomUUID(), time: new Date().toISOString(), type: 'race', message: `${race.name} 状态更新为 ${race.status}` });
-      }
+    docLoaded(state, action: PayloadAction<LedgerDoc>) {
+      state.doc = action.payload;
     },
-    saveResult(state, action: PayloadAction<{ id: string; elapsedSeconds: number; penaltySeconds: number; note: string; official: boolean }>) {
-      const entry = state.entries.find((item) => item.id === action.payload.id);
-      if (!entry) return;
-      const changed = entry.elapsedSeconds !== action.payload.elapsedSeconds || entry.penaltySeconds !== action.payload.penaltySeconds;
-      entry.elapsedSeconds = action.payload.elapsedSeconds;
-      entry.penaltySeconds = action.payload.penaltySeconds;
-      entry.note = action.payload.note;
-      entry.resultStatus = action.payload.official ? 'official' : changed ? 'corrected' : 'provisional';
-      state.timeline.unshift({ id: crypto.randomUUID(), time: new Date().toISOString(), type: 'result', message: `${entry.boat} 成绩更正为 ${entry.elapsedSeconds + entry.penaltySeconds} 秒` });
+    noticePushed(state, action: PayloadAction<{ kind: Notice['kind']; text: string }>) {
+      state.notices.push({ id: crypto.randomUUID(), ...action.payload });
     },
-    addProtest(state, action: PayloadAction<{ raceId: string; entryId: string; reason: string; rule: string }>) {
-      const protest: Protest = { id: crypto.randomUUID(), ...action.payload, status: 'submitted', decision: '', createdAt: new Date().toISOString() };
-      state.protests.unshift(protest);
-      state.timeline.unshift({ id: crypto.randomUUID(), time: protest.createdAt, type: 'protest', message: `收到 ${action.payload.rule} 抗议，等待复核` });
-    },
-    transitionProtest(state, action: PayloadAction<{ id: string; status: ProtestStatus; decision?: string; penaltySeconds?: number }>) {
-      const protest = state.protests.find((item) => item.id === action.payload.id);
-      if (!protest) return;
-      protest.status = action.payload.status;
-      protest.decision = action.payload.decision ?? protest.decision;
-      if (action.payload.status === 'resolved' && action.payload.penaltySeconds) {
-        const entry = state.entries.find((item) => item.id === protest.entryId);
-        if (entry) {
-          entry.penaltySeconds = action.payload.penaltySeconds;
-          entry.resultStatus = 'corrected';
-        }
-      }
-      state.timeline.unshift({ id: crypto.randomUUID(), time: new Date().toISOString(), type: 'protest', message: `抗议 ${action.payload.id.slice(0, 6)} 更新为 ${action.payload.status}` });
+    noticeAcked(state, action: PayloadAction<string>) {
+      state.notices = state.notices.filter((notice) => notice.id !== action.payload);
     }
   }
 });
 
-const STORAGE_KEY = 'regatta-control-v1';
-const stored = localStorage.getItem(STORAGE_KEY);
-const preloadedState = stored ? JSON.parse(stored) as AppState : initialState;
-
-export const { setRaceStatus, saveResult, addProtest, transitionProtest } = slice.actions;
+export const { docLoaded, noticePushed, noticeAcked } = slice.actions;
 
 export const store = configureStore({
-  reducer: { regatta: slice.reducer, [raceApi.reducerPath]: raceApi.reducer },
+  reducer: { ledger: slice.reducer, [raceApi.reducerPath]: raceApi.reducer },
   middleware: (getDefaultMiddleware) => getDefaultMiddleware().concat(raceApi.middleware)
 });
-store.subscribe(() => localStorage.setItem(STORAGE_KEY, JSON.stringify(store.getState().regatta)));
 
 export type RootState = ReturnType<typeof store.getState>;
 export type AppDispatch = typeof store.dispatch;
+
+const raceIdOf = (state: RootState) => primaryRaceId(state.ledger.doc);
+
+function reportCommit(dispatch: AppDispatch, result: CommitResult, okText: (doc: LedgerDoc) => string) {
+  dispatch(docLoaded(result.doc));
+  if (result.ok) {
+    if (result.rebased) {
+      dispatch(
+        noticePushed({
+          kind: 'warning',
+          text: `检测到其他标签页的更新（修订 v${result.fromRevision}），你的修改已在最新数据上合并保存为 v${result.doc.revision}`
+        })
+      );
+    }
+    dispatch(noticePushed({ kind: 'success', text: okText(result.doc) }));
+    return;
+  }
+  if (result.kind === 'conflict') {
+    dispatch(noticePushed({ kind: 'warning', text: `修订号已变化：${result.message}。已加载最新数据，请确认后重试，未覆盖他人记录。` }));
+  } else if (result.kind === 'blocked') {
+    dispatch(noticePushed({ kind: 'error', text: `无法发布正式成绩：${result.message}` }));
+  } else {
+    dispatch(noticePushed({ kind: 'error', text: result.message }));
+  }
+}
+
+const activeVersion = (doc: LedgerDoc) => currentPublication(doc, primaryRaceId(doc))?.version ?? 0;
+
+export const setRaceStatus =
+  (payload: { id: string; status: RaceStatus }) =>
+  async (dispatch: AppDispatch, getState: () => RootState): Promise<CommitResult> => {
+    const result = await commitLedger(getState().ledger.doc.revision, (doc) => applySetRaceStatus(doc, payload));
+    reportCommit(dispatch, result, () => '比赛状态已更新');
+    return result;
+  };
+
+export const saveResult =
+  (payload: { id: string; elapsedSeconds: number; penaltySeconds: number; note: string }) =>
+  async (dispatch: AppDispatch, getState: () => RootState): Promise<CommitResult> => {
+    const result = await commitLedger(getState().ledger.doc.revision, (doc) => applySaveResult(doc, payload, raceIdOf(getState())));
+    reportCommit(dispatch, result, () => '成绩已更正，标记为待复核');
+    return result;
+  };
+
+export const addProtest =
+  (payload: { raceId: string; entryId: string; reason: string; rule: string }) =>
+  async (dispatch: AppDispatch, getState: () => RootState): Promise<CommitResult> => {
+    const result = await commitLedger(getState().ledger.doc.revision, (doc) => applyAddProtest(doc, payload));
+    reportCommit(dispatch, result, () => '抗议已登记，进入复核队列');
+    return result;
+  };
+
+export const transitionProtest =
+  (payload: { id: string; status: ProtestStatus; decision?: string; penaltySeconds?: number }) =>
+  async (dispatch: AppDispatch, getState: () => RootState): Promise<CommitResult> => {
+    const before = activeVersion(getState().ledger.doc);
+    const result = await commitLedger(getState().ledger.doc.revision, (doc) => applyTransitionProtest(doc, payload));
+    reportCommit(dispatch, result, (doc) => {
+      const version = activeVersion(doc);
+      return version > before ? `抗议已处理，名次已重算并发布正式成绩 v${version}` : '抗议处理已记录';
+    });
+    return result;
+  };
+
+export const markReviewed =
+  (entryId: string) =>
+  async (dispatch: AppDispatch, getState: () => RootState): Promise<CommitResult> => {
+    const before = activeVersion(getState().ledger.doc);
+    const result = await commitLedger(getState().ledger.doc.revision, (doc) => applyMarkReviewed(doc, entryId, raceIdOf(getState())));
+    reportCommit(dispatch, result, (doc) => {
+      const version = activeVersion(doc);
+      return version > before ? `复核已确认，名次已重算并发布正式成绩 v${version}` : '复核已确认';
+    });
+    return result;
+  };
+
+export const publishResults =
+  () =>
+  async (dispatch: AppDispatch, getState: () => RootState): Promise<CommitResult> => {
+    const result = await commitLedger(getState().ledger.doc.revision, (doc) => applyPublish(doc, raceIdOf(getState())));
+    reportCommit(dispatch, result, (doc) => `正式成绩 v${activeVersion(doc)} 已发布`);
+    return result;
+  };
+
+// 其他标签页写入账本后同步到本页，保证计时台/仲裁台看到同一份数据
+if (typeof window !== 'undefined') {
+  subscribeLedger((doc) => {
+    const current = store.getState().ledger.doc.revision;
+    if (doc.revision <= current) return;
+    store.dispatch(docLoaded(doc));
+    store.dispatch(noticePushed({ kind: 'info', text: `另一标签页已更新数据（修订 v${current} → v${doc.revision}）` }));
+  });
+}

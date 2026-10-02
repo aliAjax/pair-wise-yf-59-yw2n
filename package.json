@@ -7,7 +7,8 @@
     "dev": "vite --host 0.0.0.0 --port 62024",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0 --port 62024",
-    "check": "tsc -b --pretty false"
+    "check": "tsc -b --pretty false",
+    "test": "vitest run"
   },
   "dependencies": {
     "@ant-design/icons": "^6.1.0",
@@ -28,6 +29,7 @@
     "@types/react-dom": "^19.2.2",
     "@vitejs/plugin-react": "^5.1.4",
     "typescript": "^5.9.3",
-    "vite": "^7.2.7"
+    "vite": "^7.2.7",
+    "vitest": "^4.1.11"
   }
 }
