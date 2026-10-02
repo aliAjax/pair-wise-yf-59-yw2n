@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { App as AntApp, Badge, Button, Card, Col, Descriptions, Empty, Form, Input, Layout, List, Menu, Row, Select, Space, Statistic, Table, Tag, Timeline, Typography, message } from 'antd';
+import { App as AntApp, Alert, Badge, Button, Card, Col, Collapse, Descriptions, Empty, Form, Input, Layout, List, Menu, Row, Space, Statistic, Table, Tag, Timeline, Typography, message } from 'antd';
 import { ClockCircleOutlined, FlagOutlined, PlusOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useForm } from 'react-hook-form';
@@ -7,8 +7,23 @@ import { useTranslation } from 'react-i18next';
 import { useDispatch, useSelector } from 'react-redux';
 import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { z } from 'zod';
-import { addProtest, saveResult, setRaceStatus, transitionProtest, type AppDispatch, type RootState } from './store';
+import {
+  addProtest,
+  clearDraft,
+  clearPublishError,
+  publishResults,
+  reloadFromStorage,
+  rollbackPublication,
+  saveDraft,
+  saveResult,
+  setRaceStatus,
+  transitionProtest,
+  store,
+  type AppDispatch,
+  type RootState
+} from './store';
 import { useGetOfficialsQuery } from './api';
+import { getActivePublication, hasOpenProtests, hasPendingReviewPenalties } from './ledger';
 import type { RaceEntry } from './types';
 
 const { Header, Content, Sider } = Layout;
@@ -30,17 +45,53 @@ function countdown(target: string, now: number) {
   return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
 }
 
+function RevisionTag() {
+  const { t } = useTranslation();
+  const revision = useSelector((state: RootState) => state.regatta.revision);
+  return <Tag color="blue">{t('revision')} #{revision}</Tag>;
+}
+
+function ConflictBanner() {
+  const { t } = useTranslation();
+  const dispatch = useDispatch<AppDispatch>();
+  const conflict = useSelector((state: RootState) => state.regatta.conflict);
+  const revision = useSelector((state: RootState) => state.regatta.revision);
+  if (!conflict) return null;
+  return (
+    <Alert
+      type="warning"
+      showIcon
+      style={{ marginBottom: 16 }}
+      message={t('conflictTitle')}
+      description={t('conflictBody', { rev: revision })}
+      action={<Button size="small" onClick={() => dispatch(reloadFromStorage())}>{t('reload')}</Button>}
+    />
+  );
+}
+
+function NeedsRepublishBanner() {
+  const { t } = useTranslation();
+  const publications = useSelector((state: RootState) => state.regatta.publications);
+  const active = getActivePublication(publications);
+  if (active || publications.length === 0) return null;
+  return <Alert type="error" showIcon style={{ marginBottom: 16 }} message={t('needsRepublish')} />;
+}
+
 function ControlPage() {
   const { t } = useTranslation();
   const dispatch = useDispatch<AppDispatch>();
   const race = useSelector((state: RootState) => state.regatta.races[0]);
   const entries = useSelector((state: RootState) => state.regatta.entries);
+  const publications = useSelector((state: RootState) => state.regatta.publications);
   const [now, setNow] = useState(Date.now());
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer); }, []);
   const sorted = useMemo(() => [...entries].sort((a, b) => a.elapsedSeconds + a.penaltySeconds - b.elapsedSeconds - b.penaltySeconds), [entries]);
+  const active = getActivePublication(publications);
 
   return (
     <Space direction="vertical" size="large" style={{ width: '100%' }}>
+      <ConflictBanner />
+      <NeedsRepublishBanner />
       <Row gutter={[18, 18]}>
         <Col xs={24} lg={10}>
           <Card className="hero-card">
@@ -49,6 +100,9 @@ function ControlPage() {
             <Descriptions column={1} style={{ marginTop: 18 }}>
               <Descriptions.Item label="组别">{race.fleet}</Descriptions.Item>
               <Descriptions.Item label="航线">{race.course}</Descriptions.Item>
+              <Descriptions.Item label="发布状态">
+                {active ? <Tag color="green">{t('active')}</Tag> : publications.length > 0 ? <Tag color="red">{t('superseded')}</Tag> : <Tag>{t('noPublications')}</Tag>}
+              </Descriptions.Item>
             </Descriptions>
             <Space wrap>
               <Button type="primary" icon={<FlagOutlined />} onClick={() => dispatch(setRaceStatus({ id: race.id, status: 'running' }))}>开始比赛</Button>
@@ -74,22 +128,88 @@ function ControlPage() {
   );
 }
 
+function DraftRestoreBanner({ draftKey, label, onRestore }: { draftKey: string; label: string; onRestore: (payload: Record<string, unknown>) => void }) {
+  const { t } = useTranslation();
+  const dispatch = useDispatch<AppDispatch>();
+  const draft = useSelector((state: RootState) => state.regatta.drafts[draftKey]);
+  // Only surface the draft on reopen (mount), not while the user is typing.
+  const [visible, setVisible] = useState(false);
+  useEffect(() => { if (draft) setVisible(true); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  if (!visible || !draft) return null;
+  return (
+    <Alert
+      type="info"
+      showIcon
+      style={{ marginBottom: 16 }}
+      message={t('draftRecovered', { label, time: new Date(draft.savedAt).toLocaleTimeString() })}
+      action={
+        <Space>
+          <Button size="small" type="primary" onClick={() => { onRestore(draft.payload); setVisible(false); }}>{t('draftRestore')}</Button>
+          <Button size="small" onClick={() => { dispatch(clearDraft({ key: draftKey })); setVisible(false); }}>{t('draftDiscard')}</Button>
+        </Space>
+      }
+    />
+  );
+}
+
 function ResultsPage() {
   const dispatch = useDispatch<AppDispatch>();
   const entries = useSelector((state: RootState) => state.regatta.entries);
+  const protests = useSelector((state: RootState) => state.regatta.protests);
+  const publications = useSelector((state: RootState) => state.regatta.publications);
+  const publishError = useSelector((state: RootState) => state.regatta.publishError);
+  const { t } = useTranslation();
   const [api, contextHolder] = message.useMessage();
-  const { register, handleSubmit, reset, formState: { errors } } = useForm<z.infer<typeof resultSchema>>({
+  const { register, handleSubmit, reset, watch, formState: { errors, isDirty } } = useForm<z.infer<typeof resultSchema>>({
     resolver: zodResolver(resultSchema),
     defaultValues: { id: entries[0]?.id, elapsedSeconds: 3200, penaltySeconds: 0, note: '' }
   });
+
+  const formValues = watch();
+  useEffect(() => {
+    if (!isDirty) return;
+    const handle = window.setTimeout(() => dispatch(saveDraft({ key: 'result-edit', payload: formValues })), 800);
+    return () => window.clearTimeout(handle);
+  }, [formValues, isDirty, dispatch]);
+
   const submit = (values: z.infer<typeof resultSchema>) => {
     dispatch(saveResult({ ...values, official: false }));
-    api.success('成绩已更正并进入待发布状态');
-    reset();
+    api.success(t('draftSaved'));
+    dispatch(clearDraft({ key: 'result-edit' }));
+    reset(values);
   };
+
+  const openProtests = hasOpenProtests(protests);
+  const pendingPenalties = hasPendingReviewPenalties(entries);
+  const blocked = openProtests || pendingPenalties;
+  const active = getActivePublication(publications);
+
+  const handlePublish = () => {
+    dispatch(publishResults({ publishedBy: '计时台', note: '' }));
+    const err = store.getState().regatta.publishError;
+    if (err) {
+      api.error(t(err));
+      dispatch(clearPublishError());
+    } else {
+      api.success(t('publishSuccess'));
+    }
+  };
+
+  const handleRollback = (id: string) => {
+    dispatch(rollbackPublication({ id }));
+    api.success(t('rollbackSuccess'));
+  };
+
   return (
     <>
       {contextHolder}
+      <ConflictBanner />
+      <DraftRestoreBanner
+        draftKey="result-edit"
+        label={t('resultDraftLabel')}
+        onRestore={(payload) => reset(payload as z.infer<typeof resultSchema>)}
+      />
+      <NeedsRepublishBanner />
       <Row gutter={[18, 18]}>
         <Col xs={24} lg={10}>
           <Card title="成绩更正">
@@ -105,15 +225,51 @@ function ResultsPage() {
           </Card>
         </Col>
         <Col xs={24} lg={14}>
-          <Card title="临时与正式成绩">
-            <List dataSource={entries} renderItem={(entry) => (
-              <List.Item actions={[
-                <Button key="publish" size="small" type="link" onClick={() => dispatch(saveResult({ id: entry.id, elapsedSeconds: entry.elapsedSeconds, penaltySeconds: entry.penaltySeconds, note: entry.note, official: true }))}>发布正式</Button>
-              ]}>
-                <List.Item.Meta title={`${entry.boat} · ${entry.elapsedSeconds + entry.penaltySeconds} 秒`} description={entry.note || '无更正说明'} />
-                <Tag color={entry.resultStatus === 'official' ? 'green' : 'orange'}>{entry.resultStatus}</Tag>
-              </List.Item>
-            )} />
+          <Card title={t('publishResults')} style={{ marginBottom: 18 }}>
+            <Space direction="vertical" style={{ width: '100%' }}>
+              {openProtests && <Alert type="error" showIcon message={t('openProtestsWarn')} />}
+              {pendingPenalties && <Alert type="error" showIcon message={t('pendingPenaltiesWarn')} />}
+              {publishError && <Alert type="error" showIcon message={t(publishError)} />}
+              <Space>
+                <Button type="primary" disabled={blocked} onClick={handlePublish}>{t('publishResults')}</Button>
+                {active && <Tag color="green">{t('active')} · #{active.revision}</Tag>}
+              </Space>
+            </Space>
+          </Card>
+          <Card title={t('publications')}>
+            {publications.length === 0 ? <Empty description={t('noPublications')} /> : (
+              <Collapse
+                items={publications.map((pub) => ({
+                  key: pub.id,
+                  label: (
+                    <Space>
+                      <Tag color={pub.status === 'active' ? 'green' : pub.status === 'superseded' ? 'red' : 'default'}>
+                        {pub.status === 'active' ? t('active') : pub.status === 'superseded' ? t('superseded') : t('rolledBack')}
+                      </Tag>
+                      <span>#{pub.revision}</span>
+                      <small>{new Date(pub.publishedAt).toLocaleString()}</small>
+                    </Space>
+                  ),
+                  extra: pub.status !== 'active' ? <Button size="small" onClick={(e) => { e.stopPropagation(); handleRollback(pub.id); }}>{t('rollback')}</Button> : null,
+                  children: (
+                    <Table
+                      rowKey="entryId"
+                      size="small"
+                      pagination={false}
+                      dataSource={pub.rankings}
+                      columns={[
+                        { title: t('rankings'), dataIndex: 'rank', width: 64 },
+                        { title: '船名', dataIndex: 'boat' },
+                        { title: '帆号', dataIndex: 'sailNo' },
+                        { title: '净用时', dataIndex: 'elapsedSeconds' },
+                        { title: '处罚', dataIndex: 'penaltySeconds' },
+                        { title: '总用时', dataIndex: 'totalSeconds' }
+                      ]}
+                    />
+                  )
+                }))}
+              />
+            )}
           </Card>
         </Col>
       </Row>
@@ -126,14 +282,31 @@ function ProtestsPage() {
   const protests = useSelector((state: RootState) => state.regatta.protests);
   const timeline = useSelector((state: RootState) => state.regatta.timeline);
   const entries = useSelector((state: RootState) => state.regatta.entries);
-  const { register, handleSubmit, reset, formState: { errors } } = useForm<z.infer<typeof protestSchema>>({ resolver: zodResolver(protestSchema), defaultValues: { entryId: entries[0]?.id, reason: '', rule: 'RRS 14' } });
+  const { t } = useTranslation();
+  const { register, handleSubmit, reset, watch, formState: { errors, isDirty } } = useForm<z.infer<typeof protestSchema>>({ resolver: zodResolver(protestSchema), defaultValues: { entryId: entries[0]?.id, reason: '', rule: 'RRS 14' } });
+
+  const formValues = watch();
+  useEffect(() => {
+    if (!isDirty) return;
+    const handle = window.setTimeout(() => dispatch(saveDraft({ key: 'protest-edit', payload: formValues })), 800);
+    return () => window.clearTimeout(handle);
+  }, [formValues, isDirty, dispatch]);
+
   const submit = (values: z.infer<typeof protestSchema>) => {
     dispatch(addProtest({ raceId: 'race-1', ...values }));
+    dispatch(clearDraft({ key: 'protest-edit' }));
     reset({ entryId: entries[0]?.id, reason: '', rule: 'RRS 14' });
   };
+
   return (
     <Row gutter={[18, 18]}>
       <Col xs={24} lg={9}>
+        <ConflictBanner />
+        <DraftRestoreBanner
+          draftKey="protest-edit"
+          label={t('protestDraftLabel')}
+          onRestore={(payload) => reset(payload as z.infer<typeof protestSchema>)}
+        />
         <Card title="提交抗议">
           <Form layout="vertical" onFinish={handleSubmit(submit)}>
             <Form.Item label="参赛船" validateStatus={errors.entryId ? 'error' : undefined}>
@@ -146,6 +319,7 @@ function ProtestsPage() {
         </Card>
       </Col>
       <Col xs={24} lg={9}>
+        <NeedsRepublishBanner />
         <Card title="冲突复核队列">
           {protests.length === 0 ? <Empty /> : <List dataSource={protests} renderItem={(item) => (
             <List.Item>
@@ -177,25 +351,25 @@ function Shell() {
   return (
     <AntApp>
       <Layout className="shell">
-      <Header className="header">
-        <Space><SafetyCertificateOutlined style={{ fontSize: 24 }} /><Typography.Title level={4} style={{ margin: 0, color: 'white' }}>{t('title')}</Typography.Title></Space>
-        <Space><Tag>{data.length} 名值班人员</Tag><Button ghost onClick={() => void i18n.changeLanguage(i18n.language.startsWith('zh') ? 'en' : 'zh')}>{t('language')}</Button></Space>
-      </Header>
-      <Layout>
-        <Sider width={210} breakpoint="lg" collapsedWidth="0" theme="light">
-          <Menu mode="inline" selectedKeys={[location.pathname]} onClick={({ key }) => navigate(key)} items={[
-            { key: '/', label: t('control'), icon: <FlagOutlined /> },
-            { key: '/results', label: t('results'), icon: <ClockCircleOutlined /> },
-            { key: '/protests', label: t('protests'), icon: <SafetyCertificateOutlined /> }
-          ]} />
-        </Sider>
-        <Content className="content"><Routes>
-          <Route path="/" element={<ControlPage />} />
-          <Route path="/results" element={<ResultsPage />} />
-          <Route path="/protests" element={<ProtestsPage />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes></Content>
-      </Layout>
+        <Header className="header">
+          <Space><SafetyCertificateOutlined style={{ fontSize: 24 }} /><Typography.Title level={4} style={{ margin: 0, color: 'white' }}>{t('title')}</Typography.Title></Space>
+          <Space><RevisionTag /><Tag>{data.length} 名值班人员</Tag><Button ghost onClick={() => void i18n.changeLanguage(i18n.language.startsWith('zh') ? 'en' : 'zh')}>{t('language')}</Button></Space>
+        </Header>
+        <Layout>
+          <Sider width={210} breakpoint="lg" collapsedWidth="0" theme="light">
+            <Menu mode="inline" selectedKeys={[location.pathname]} onClick={({ key }) => navigate(key)} items={[
+              { key: '/', label: t('control'), icon: <FlagOutlined /> },
+              { key: '/results', label: t('results'), icon: <ClockCircleOutlined /> },
+              { key: '/protests', label: t('protests'), icon: <SafetyCertificateOutlined /> }
+            ]} />
+          </Sider>
+          <Content className="content"><Routes>
+            <Route path="/" element={<ControlPage />} />
+            <Route path="/results" element={<ResultsPage />} />
+            <Route path="/protests" element={<ProtestsPage />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes></Content>
+        </Layout>
       </Layout>
     </AntApp>
   );
